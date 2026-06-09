@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cctype>
 #include <chrono>
 #include <memory>
 #include <string>
@@ -16,6 +17,74 @@
 
 namespace cl_moveit2z
 {
+namespace detail
+{
+inline bool getBoolParameter(
+  const rclcpp::Node::SharedPtr & node, const std::string & name, bool defaultValue)
+{
+  rclcpp::Parameter parameter;
+  if (!node->get_parameter(name, parameter))
+  {
+    return defaultValue;
+  }
+
+  if (parameter.get_type() == rclcpp::ParameterType::PARAMETER_BOOL)
+  {
+    return parameter.as_bool();
+  }
+
+  if (parameter.get_type() == rclcpp::ParameterType::PARAMETER_STRING)
+  {
+    auto value = parameter.as_string();
+    std::transform(value.begin(), value.end(), value.begin(), ::tolower);
+    if (value == "true" || value == "1" || value == "yes" || value == "on")
+    {
+      return true;
+    }
+    if (value == "false" || value == "0" || value == "no" || value == "off")
+    {
+      return false;
+    }
+  }
+
+  return defaultValue;
+}
+
+inline double getDoubleParameter(
+  const rclcpp::Node::SharedPtr & node, const std::string & name, double defaultValue)
+{
+  rclcpp::Parameter parameter;
+  if (!node->get_parameter(name, parameter))
+  {
+    return defaultValue;
+  }
+
+  if (parameter.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE)
+  {
+    return parameter.as_double();
+  }
+
+  if (parameter.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER)
+  {
+    return static_cast<double>(parameter.as_int());
+  }
+
+  if (parameter.get_type() == rclcpp::ParameterType::PARAMETER_STRING)
+  {
+    try
+    {
+      return std::stod(parameter.as_string());
+    }
+    catch (const std::exception &)
+    {
+      return defaultValue;
+    }
+  }
+
+  return defaultValue;
+}
+}  // namespace detail
+
 class CbCtrlGripper : public smacc2::SmaccAsyncClientBehavior
 {
 public:
@@ -79,6 +148,15 @@ public:
   {
     command_completed_ = false;
     waiting_feedback_ = false;
+    success_pending_ = false;
+    enable_gripper_control_ = true;
+    simulated_action_duration_sec_ = 2.0;
+    gripper_action_delay_sec_ = 0.0;
+
+    auto node = getNode();
+    enable_gripper_control_ = detail::getBoolParameter(node, "enable_gripper_control", true);
+    simulated_action_duration_sec_ = detail::getDoubleParameter(node, "simulated_gripper_action_sec", 2.0);
+    gripper_action_delay_sec_ = detail::getDoubleParameter(node, "gripper_action_delay_sec", 0.0);
 
     if (!left_valid_ && !right_valid_)
     {
@@ -124,14 +202,35 @@ public:
       position_tolerance_ = 0.03;
     }
 
+    if (!enable_gripper_control_)
+    {
+      const double effectiveDelay = getEffectiveCompletionDelaySec();
+      RCLCPP_INFO(
+        getLogger(),
+        "[CbCtrlGripper] enable_gripper_control=false, simulating gripper action for %.2fs",
+        effectiveDelay);
+      scheduleSuccess(position_, position_, effectiveDelay);
+      return;
+    }
+
     if (!publisher_)
     {
       publisher_ =
-        getNode()->create_publisher<je_software::msg::EndEffectorCommandLR>(topic_, rclcpp::QoS(10).reliable());
+        node->create_publisher<je_software::msg::EndEffectorCommandLR>(topic_, rclcpp::QoS(10).reliable());
     }
 
     if (publisher_->get_subscription_count() == 0)
     {
+      if (!wait_for_feedback_)
+      {
+        RCLCPP_ERROR(
+          getLogger(),
+          "[CbCtrlGripper] No subscribers on %s in open-loop mode; refusing to report success.",
+          topic_.c_str());
+        markFailure("No gripper command subscribers in open-loop mode");
+        return;
+      }
+
       RCLCPP_WARN(
         getLogger(),
         "[CbCtrlGripper] Topic %s has no subscribers at command dispatch time. The gripper command may be ignored.",
@@ -140,7 +239,7 @@ public:
 
     if (wait_for_feedback_ && !feedback_sub_)
     {
-      feedback_sub_ = getNode()->create_subscription<common::msg::OculusInitJointState>(
+      feedback_sub_ = node->create_subscription<common::msg::OculusInitJointState>(
         feedback_topic_,
         rclcpp::QoS(10).reliable(),
         [this](const common::msg::OculusInitJointState::SharedPtr msg)
@@ -151,7 +250,7 @@ public:
 
     if (wait_for_feedback_ && feedback_topic_ != legacy_feedback_topic_ && !feedback_sub_legacy_)
     {
-      feedback_sub_legacy_ = getNode()->create_subscription<common::msg::OculusInitJointState>(
+      feedback_sub_legacy_ = node->create_subscription<common::msg::OculusInitJointState>(
         legacy_feedback_topic_,
         rclcpp::QoS(10).reliable(),
         [this](const common::msg::OculusInitJointState::SharedPtr msg)
@@ -184,12 +283,12 @@ public:
 
     publisher_->publish(msg);
 
-    command_sent_time_ = getNode()->now();
+    command_sent_time_ = node->now();
     waiting_feedback_ = true;
 
     if (!watchdog_timer_)
     {
-      watchdog_timer_ = getNode()->create_wall_timer(
+      watchdog_timer_ = node->create_wall_timer(
         std::chrono::milliseconds(50),
         [this]()
         {
@@ -218,6 +317,11 @@ public:
   void onExit() override
   {
     waiting_feedback_ = false;
+    if (completion_timer_)
+    {
+      completion_timer_->cancel();
+      completion_timer_.reset();
+    }
     if (watchdog_timer_)
     {
       watchdog_timer_->cancel();
@@ -238,7 +342,7 @@ private:
     {
       if (!wait_for_feedback_)
       {
-        markSuccess(position_, position_);
+        scheduleSuccess(position_, position_);
       }
       else if (mode_ == je_software::msg::EndEffectorCommand::MODE_POSITION)
       {
@@ -247,7 +351,7 @@ private:
       else
       {
         // Preset mode cannot be inferred precisely from position feedback; keep timeout success fallback.
-        markSuccess(position_, position_);
+        scheduleSuccess(position_, position_);
       }
     }
   }
@@ -264,8 +368,60 @@ private:
 
     if (leftOk && rightOk)
     {
-      markSuccess(msg->left_gripper, msg->right_gripper);
+      scheduleSuccess(msg->left_gripper, msg->right_gripper);
     }
+  }
+
+  double getEffectiveCompletionDelaySec() const
+  {
+    if (gripper_action_delay_sec_ > 0.0)
+    {
+      return gripper_action_delay_sec_;
+    }
+
+    if (!enable_gripper_control_)
+    {
+      return simulated_action_duration_sec_ > 0.0 ? simulated_action_duration_sec_ : 2.0;
+    }
+
+    return 0.0;
+  }
+
+  void scheduleSuccess(double leftFeedback, double rightFeedback, double delaySec = -1.0)
+  {
+    if (command_completed_ || success_pending_ || completion_timer_)
+    {
+      return;
+    }
+
+    success_pending_ = true;
+    waiting_feedback_ = false;
+
+    if (watchdog_timer_)
+    {
+      watchdog_timer_->cancel();
+      watchdog_timer_.reset();
+    }
+
+    const double effectiveDelay = delaySec >= 0.0 ? delaySec : getEffectiveCompletionDelaySec();
+    if (effectiveDelay <= 0.0)
+    {
+      markSuccess(leftFeedback, rightFeedback);
+      return;
+    }
+
+    pending_left_feedback_ = leftFeedback;
+    pending_right_feedback_ = rightFeedback;
+    completion_timer_ = getNode()->create_wall_timer(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(effectiveDelay)),
+      [this]()
+      {
+        if (command_completed_ || !success_pending_)
+        {
+          return;
+        }
+        markSuccess(pending_left_feedback_, pending_right_feedback_);
+      });
   }
 
   bool isTargetReached(double feedbackValue) const
@@ -298,6 +454,7 @@ private:
     }
 
     command_completed_ = true;
+    success_pending_ = false;
     waiting_feedback_ = false;
 
     if (watchdog_timer_)
@@ -305,9 +462,16 @@ private:
       watchdog_timer_->cancel();
       watchdog_timer_.reset();
     }
+    if (completion_timer_)
+    {
+      completion_timer_->cancel();
+      completion_timer_.reset();
+    }
 
     RCLCPP_INFO(
       getLogger(),
+      !enable_gripper_control_ ?
+        "[CbCtrlGripper] Simulated gripper action success. left=%.4f right=%.4f mode=%d target_pos=%.4f preset=%d command=%s torque=%.4f" :
       wait_for_feedback_ ?
         "[CbCtrlGripper] Feedback reached target. left=%.4f right=%.4f mode=%d target_pos=%.4f preset=%d command=%s torque=%.4f" :
         "[CbCtrlGripper] Open-loop command duration elapsed. left=%.4f right=%.4f mode=%d target_pos=%.4f preset=%d command=%s torque=%.4f",
@@ -323,12 +487,18 @@ private:
     }
 
     command_completed_ = true;
+    success_pending_ = false;
     waiting_feedback_ = false;
 
     if (watchdog_timer_)
     {
       watchdog_timer_->cancel();
       watchdog_timer_.reset();
+    }
+    if (completion_timer_)
+    {
+      completion_timer_->cancel();
+      completion_timer_.reset();
     }
 
     RCLCPP_WARN(getLogger(), "[CbCtrlGripper] %s", reason);
@@ -348,14 +518,21 @@ private:
   std::string command_{};
   double torque_{0.0};
   bool wait_for_feedback_{true};
+  bool enable_gripper_control_{true};
+  double simulated_action_duration_sec_{2.0};
+  double gripper_action_delay_sec_{0.0};
 
   bool waiting_feedback_{false};
   bool command_completed_{false};
+  bool success_pending_{false};
+  double pending_left_feedback_{0.0};
+  double pending_right_feedback_{0.0};
   rclcpp::Time command_sent_time_{0, 0, RCL_ROS_TIME};
 
   rclcpp::Publisher<je_software::msg::EndEffectorCommandLR>::SharedPtr publisher_;
   rclcpp::Subscription<common::msg::OculusInitJointState>::SharedPtr feedback_sub_;
   rclcpp::Subscription<common::msg::OculusInitJointState>::SharedPtr feedback_sub_legacy_;
   rclcpp::TimerBase::SharedPtr watchdog_timer_;
+  rclcpp::TimerBase::SharedPtr completion_timer_;
 };
 }  // namespace cl_moveit2z
