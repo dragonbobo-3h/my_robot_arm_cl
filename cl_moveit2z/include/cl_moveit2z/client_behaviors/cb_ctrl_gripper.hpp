@@ -83,6 +83,19 @@ inline double getDoubleParameter(
 
   return defaultValue;
 }
+
+inline std::string getStringParameter(
+  const rclcpp::Node::SharedPtr & node, const std::string & name,
+  const std::string & defaultValue)
+{
+  rclcpp::Parameter parameter;
+  if (node->get_parameter(name, parameter) &&
+    parameter.get_type() == rclcpp::ParameterType::PARAMETER_STRING)
+  {
+    return parameter.as_string();
+  }
+  return defaultValue;
+}
 }  // namespace detail
 
 class CbCtrlGripper : public smacc2::SmaccAsyncClientBehavior
@@ -94,7 +107,8 @@ public:
     int mode, double position, int preset = 0, bool leftValid = true, bool rightValid = false,
     std::string topic = "/end_effector_cmd_lr", double timeoutSec = 2.0,
     std::string feedbackTopic = "/joint_states_double_arm", double positionTolerance = 0.03,
-    std::string command = "", double torque = 0.0, bool waitForFeedback = true)
+    std::string command = "", double torque = 0.0, bool waitForFeedback = true,
+    double commandDelaySec = -1.0)
   : mode_(mode),
     position_(position),
     preset_(preset),
@@ -106,7 +120,8 @@ public:
     position_tolerance_(positionTolerance),
     command_(normalizeCommand(command)),
     torque_(torque),
-    wait_for_feedback_(waitForFeedback)
+    wait_for_feedback_(waitForFeedback),
+    command_delay_sec_(commandDelaySec)
   {
   }
 
@@ -158,10 +173,23 @@ public:
     simulated_action_duration_sec_ = detail::getDoubleParameter(node, "simulated_gripper_action_sec", 2.0);
     gripper_action_delay_sec_ = detail::getDoubleParameter(node, "gripper_action_delay_sec", 0.0);
 
+    const auto controlledArm = detail::getStringParameter(node, "controlled_arm", "both");
+    if (controlledArm == "left")
+    {
+      right_valid_ = false;
+    }
+    else if (controlledArm == "right")
+    {
+      left_valid_ = false;
+    }
+
     if (!left_valid_ && !right_valid_)
     {
-      RCLCPP_WARN(getLogger(), "[CbCtrlGripper] Both left_valid and right_valid are false.");
-      markFailure("Both left_valid and right_valid are false");
+      RCLCPP_INFO(
+        getLogger(),
+        "[CbCtrlGripper] Command skipped because it only targets the blocked arm (controlled_arm=%s).",
+        controlledArm.c_str());
+      scheduleSuccess(position_, position_, 0.0);
       return;
     }
 
@@ -299,9 +327,9 @@ public:
     RCLCPP_INFO(
       getLogger(),
       "[CbCtrlGripper] Published cmd topic=%s mode=%d left_valid=%d right_valid=%d position=%.4f "
-      "preset=%d command=%s torque=%.4f wait_for_feedback=%d feedback_topic=%s fallback_feedback_topic=%s timeout=%.2fs tol=%.4f",
+      "preset=%d command=%s torque=%.4f wait_for_feedback=%d command_delay_sec=%.2f feedback_topic=%s fallback_feedback_topic=%s timeout=%.2fs tol=%.4f",
       topic_.c_str(), mode_, left_valid_, right_valid_, position_, preset_, command_.c_str(), torque_,
-      wait_for_feedback_, feedback_topic_.c_str(), legacy_feedback_topic_.c_str(), timeout_sec_,
+      wait_for_feedback_, command_delay_sec_, feedback_topic_.c_str(), legacy_feedback_topic_.c_str(), timeout_sec_,
       position_tolerance_);
 
     if (!wait_for_feedback_)
@@ -374,6 +402,11 @@ private:
 
   double getEffectiveCompletionDelaySec() const
   {
+    if (command_delay_sec_ >= 0.0)
+    {
+      return command_delay_sec_;
+    }
+
     if (gripper_action_delay_sec_ > 0.0)
     {
       return gripper_action_delay_sec_;
@@ -426,11 +459,13 @@ private:
 
   bool isTargetReached(double feedbackValue) const
   {
-    if (mode_ == je_software::msg::EndEffectorCommand::MODE_POSITION)
+    if (
+      mode_ == je_software::msg::EndEffectorCommand::MODE_POSITION ||
+      mode_ == je_software::msg::EndEffectorCommand::MODE_TORQUE)
     {
       return std::fabs(feedbackValue - position_) <= position_tolerance_;
     }
-    // Preset/torque modes currently have no reversible feedback mapping; any finite feedback is acceptable.
+    // Preset mode currently has no reversible feedback mapping; any finite feedback is acceptable.
     return std::isfinite(feedbackValue);
   }
 
@@ -521,6 +556,7 @@ private:
   bool enable_gripper_control_{true};
   double simulated_action_duration_sec_{2.0};
   double gripper_action_delay_sec_{0.0};
+  double command_delay_sec_{-1.0};
 
   bool waiting_feedback_{false};
   bool command_completed_{false};

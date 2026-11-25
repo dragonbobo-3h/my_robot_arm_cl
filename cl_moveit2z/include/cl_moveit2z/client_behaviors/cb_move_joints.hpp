@@ -38,6 +38,7 @@ class CbMoveJoints : public smacc2::SmaccAsyncClientBehavior
 {
 public:
   std::optional<double> scalingFactor_;
+  std::optional<double> accelerationScalingFactor_;
   std::optional<double> planningTimeSec_;
   std::optional<int> planningAttempts_;
   std::optional<bool> allowReplanning_;
@@ -230,6 +231,10 @@ protected:
       if (scalingFactor_)
       {
         options.maxVelocityScaling = *scalingFactor_;
+      if (accelerationScalingFactor_)
+      {
+        options.maxAccelerationScaling = *accelerationScalingFactor_;
+      }
       }
 
       auto result = motionPlanner->planToJointTarget(jointValueTarget_, options);
@@ -256,6 +261,8 @@ protected:
         "(consider adding CpMotionPlanner component)");
 
       if (scalingFactor_) moveGroupInterface.setMaxVelocityScalingFactor(*scalingFactor_);
+      if (accelerationScalingFactor_)
+        moveGroupInterface.setMaxAccelerationScalingFactor(*accelerationScalingFactor_);
       if (planningTimeSec_) moveGroupInterface.setPlanningTime(*planningTimeSec_);
       if (planningAttempts_) moveGroupInterface.setNumPlanningAttempts(*planningAttempts_);
       if (allowReplanning_) moveGroupInterface.allowReplanning(*allowReplanning_);

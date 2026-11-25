@@ -1,9 +1,11 @@
 # Cartesian linear motion parameters (shared by all cartesian moves)
 # These params are auto-loaded by CbMoveEndEffectorLinearSeeded without needing recompilation
 
-linear_step_meters: 0.005         # IK sampling density (m) - smaller = more waypoints = smoother but slower
+linear_step_meters: 0.015         # IK sampling density (m) - 15 mm avoids pick_ik 1 mm noise causing TOTG velocity dips
 planning_time_sec: 1.0            # Max planning time (seconds)
 max_segments: 200                 # Maximum waypoints in cartesian path
-jump_threshold: 0.0               # Joint-space jump threshold (0 = disabled)
+jump_threshold: 0.0               # MoveIt relative jump threshold (0 = disabled; use explicit rad guards below)
+max_joint_step_rad: 1.5           # Max single-joint delta between adjacent waypoints in rad (0 = disabled)
+max_joint_total_delta_rad: 6.2832 # Max cumulative single-joint travel over one cartesian path in rad (2*pi, 0 = disabled)
 min_path_fraction: 0.98           # Min success fraction (98% = allow up to 2% partial paths to fail)
 velocity_scaling: 1.0             # Velocity scaling factor (1.0 = 100%, no slowdown from joint moves)

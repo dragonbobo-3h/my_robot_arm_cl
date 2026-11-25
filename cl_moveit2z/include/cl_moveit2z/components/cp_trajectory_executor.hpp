@@ -30,8 +30,10 @@
 #include <moveit_msgs/msg/robot_trajectory.hpp>
 
 #include <chrono>
+#include <algorithm>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace cl_moveit2z
 {
@@ -124,6 +126,63 @@ public:
     }
 
     auto & moveGroup = moveit2zClient_->moveGroupClientInterface;
+    auto filteredTrajectory = trajectory;
+
+    std::string controlledArm = "both";
+    getNode()->get_parameter_or("controlled_arm", controlledArm, std::string("both"));
+    if (controlledArm == "left" || controlledArm == "right")
+    {
+      auto & jointTrajectory = filteredTrajectory.joint_trajectory;
+      std::vector<std::size_t> blockedIndices;
+      for (std::size_t i = 0; i < jointTrajectory.joint_names.size(); ++i)
+      {
+        const auto & jointName = jointTrajectory.joint_names[i];
+        const bool isRightJoint =
+          (jointName.size() == 7 && jointName.rfind("joint2", 0) == 0) ||
+          jointName.rfind("r_joint", 0) == 0;
+        if ((controlledArm == "left" && isRightJoint) ||
+          (controlledArm == "right" && !isRightJoint))
+        {
+          blockedIndices.push_back(i);
+        }
+      }
+
+      const auto eraseBlocked = [&blockedIndices](auto & values)
+      {
+        for (auto it = blockedIndices.rbegin(); it != blockedIndices.rend(); ++it)
+        {
+          if (*it < values.size())
+          {
+            values.erase(values.begin() + static_cast<std::ptrdiff_t>(*it));
+          }
+        }
+      };
+
+      eraseBlocked(jointTrajectory.joint_names);
+      for (auto & point : jointTrajectory.points)
+      {
+        eraseBlocked(point.positions);
+        eraseBlocked(point.velocities);
+        eraseBlocked(point.accelerations);
+        eraseBlocked(point.effort);
+      }
+
+      if (jointTrajectory.joint_names.empty())
+      {
+        result.success = true;
+        result.errorCode.val = moveit_msgs::msg::MoveItErrorCodes::SUCCESS;
+        result.errorMessage = "Trajectory skipped because it only targets the blocked arm";
+        RCLCPP_INFO(
+          getLogger(), "[CpTrajectoryExecutor] %s (controlled_arm=%s)",
+          result.errorMessage.c_str(), controlledArm.c_str());
+        return result;
+      }
+
+      RCLCPP_INFO(
+        getLogger(),
+        "[CpTrajectoryExecutor] controlled_arm=%s: removed %zu blocked joint(s), executing %zu joint(s)",
+        controlledArm.c_str(), blockedIndices.size(), jointTrajectory.joint_names.size());
+    }
 
     try
     {
@@ -132,13 +191,13 @@ public:
 
       RCLCPP_INFO(
         getLogger(), "[CpTrajectoryExecutor] Executing trajectory with %lu points...",
-        trajectory.joint_trajectory.points.size());
+        filteredTrajectory.joint_trajectory.points.size());
 
       // Track execution time
       auto startTime = std::chrono::steady_clock::now();
 
       // Execute trajectory
-      result.errorCode = moveGroup->execute(trajectory);
+      result.errorCode = moveGroup->execute(filteredTrajectory);
 
       auto endTime = std::chrono::steady_clock::now();
       result.executionTime = std::chrono::duration<double>(endTime - startTime);
@@ -162,7 +221,7 @@ public:
       if (options.recordToHistory && trajectoryHistory_)
       {
         std::string trajName = options.trajectoryName.value_or("unnamed_trajectory");
-        recordToHistory(trajectory, result.errorCode, trajName);
+        recordToHistory(filteredTrajectory, result.errorCode, trajName);
       }
     }
     catch (const std::exception & e)

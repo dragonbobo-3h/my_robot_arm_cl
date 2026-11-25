@@ -56,6 +56,8 @@ public:
   double linearStepMeters_{0.01};
   int maxSegments_{200};
   double jumpThreshold_{0.0};
+  double maxJointStepRad_{1.5};
+  double maxJointTotalDeltaRad_{6.2832};
   double minPathFraction_{0.98};
   std::optional<double> velocityScaling_;  // Optional velocity scaling (resets inherited value)
 
@@ -81,6 +83,7 @@ public:
     // Auto-load cartesian motion parameters from YAML (if available)
     // This allows tuning velocity/trajectory params without recompilation
     loadConfigFromYaml("cl_moveit2z", "config/cartesian.yaml");
+    loadSpeedOverrideFromYaml("je_arm_pcb_inspection_sm", "config/motion_speed.yaml");
 
     // Reset MoveGroup velocity scaling to prevent inheritance from prior joint moves
     if (velocityScaling_)
@@ -114,43 +117,23 @@ public:
     const double dz = targetPose.pose.position.z - currentPose.pose.position.z;
     const double distance = std::sqrt(dx * dx + dy * dy + dz * dz);
 
-    int segments = std::max(1, static_cast<int>(std::ceil(distance / linearStepMeters_)));
-    segments = std::min(segments, maxSegments_);
-
-    tf2::Quaternion qStart;
-    tf2::Quaternion qTarget;
-    tf2::fromMsg(currentPose.pose.orientation, qStart);
-    tf2::fromMsg(targetPose.pose.orientation, qTarget);
-    qStart.normalize();
-    qTarget.normalize();
+    // Let MoveIt's computeCartesianPath perform a single uniform interpolation
+    // directly to targetPose.pose. Pre-subdividing at linearStepMeters_ caused
+    // MoveIt to re-subdivide every segment in half when pick_ik stops within
+    // its 1 mm tolerance (doubling waypoint count and slowing IPTP/TOTG by >2x).
+    double effectiveStep = linearStepMeters_;
+    if (maxSegments_ > 0 && distance > 0.0)
+    {
+      effectiveStep = std::max(effectiveStep, distance / static_cast<double>(maxSegments_));
+    }
 
     RCLCPP_INFO(
       getLogger(),
-      "[CbMoveEndEffectorLinearSeeded] linear move start -> target, distance=%.4f m, segments=%d, step=%.4f m",
-      distance, segments, linearStepMeters_);
+      "[CbMoveEndEffectorLinearSeeded] linear move start -> target, distance=%.4f m, effectiveStep=%.4f m, velScale=%.3f",
+      distance, effectiveStep, velocityScaling_.value_or(1.0));
 
     std::vector<geometry_msgs::msg::Pose> waypoints;
-    waypoints.reserve(static_cast<size_t>(segments));
-
-    for (int i = 1; i <= segments; i++)
-    {
-      if (isShutdownRequested())
-      {
-        RCLCPP_WARN(getLogger(), "[CbMoveEndEffectorLinearSeeded] canceled before building waypoint %d", i);
-        return;
-      }
-
-      const double t = static_cast<double>(i) / static_cast<double>(segments);
-      geometry_msgs::msg::Pose waypoint;
-      waypoint.position.x = currentPose.pose.position.x + t * dx;
-      waypoint.position.y = currentPose.pose.position.y + t * dy;
-      waypoint.position.z = currentPose.pose.position.z + t * dz;
-
-      const tf2::Quaternion qInterp = qStart.slerp(qTarget, t);
-      waypoint.orientation = tf2::toMsg(qInterp);
-
-      waypoints.push_back(waypoint);
-    }
+    waypoints.push_back(targetPose.pose);
 
     if (isShutdownRequested())
     {
@@ -161,7 +144,7 @@ public:
     mgi.setStartStateToCurrentState();
     moveit_msgs::msg::RobotTrajectory trajectory;
     const double pathFraction =
-      mgi.computeCartesianPath(waypoints, linearStepMeters_, jumpThreshold_, trajectory, true);
+      mgi.computeCartesianPath(waypoints, effectiveStep, jumpThreshold_, trajectory, true);
 
     if (pathFraction < minPathFraction_)
     {
@@ -176,6 +159,18 @@ public:
       }
       return;
     }
+
+    if (!validateTrajectoryJointExcursion(trajectory))
+    {
+      if (!isShutdownRequested())
+      {
+        movegroupClient_->postEventMotionExecutionFailed();
+        this->postFailureEvent();
+      }
+      return;
+    }
+
+    applyCartesianVelocityScaling(trajectory);
 
     if (isShutdownRequested())
     {
@@ -257,6 +252,14 @@ public:
       {
         jumpThreshold_ = node["jump_threshold"].as<double>();
       }
+      if (node["max_joint_step_rad"])
+      {
+        maxJointStepRad_ = node["max_joint_step_rad"].as<double>();
+      }
+      if (node["max_joint_total_delta_rad"])
+      {
+        maxJointTotalDeltaRad_ = node["max_joint_total_delta_rad"].as<double>();
+      }
       if (node["min_path_fraction"])
       {
         minPathFraction_ = node["min_path_fraction"].as<double>();
@@ -268,12 +271,14 @@ public:
 
       RCLCPP_INFO(
         getLogger(),
-        "[CbMoveEndEffectorLinearSeeded] loaded config from %s: step=%.4f, planTime=%.2f, maxSegs=%d, jumpThresh=%.4f, minPathFrac=%.3f, velScale=%s",
+        "[CbMoveEndEffectorLinearSeeded] loaded config from %s: step=%.4f, planTime=%.2f, maxSegs=%d, jumpThresh=%.4f, maxJointStep=%.3f, maxJointTotal=%.3f, minPathFrac=%.3f, velScale=%s",
         fullpath.c_str(),
         linearStepMeters_,
         planningTimeSec_,
         maxSegments_,
         jumpThreshold_,
+        maxJointStepRad_,
+        maxJointTotalDeltaRad_,
         minPathFraction_,
         velocityScaling_ ? std::to_string(*velocityScaling_).c_str() : "default(1.0)");
     }
@@ -285,7 +290,132 @@ public:
     }
   }
 
+  void loadSpeedOverrideFromYaml(const std::string & pkg, const std::string & filepath)
+  {
+    std::string pkgpath;
+    try
+    {
+      pkgpath = ament_index_cpp::get_package_share_directory(pkg);
+    }
+    catch (const std::exception &)
+    {
+      return;
+    }
+
+    const std::string fullpath = pkgpath + "/" + filepath;
+    if (!std::filesystem::exists(fullpath))
+    {
+      return;
+    }
+
+    try
+    {
+      const YAML::Node node = YAML::LoadFile(fullpath);
+      const double globalScale =
+        node["global_speed_scale"] ? node["global_speed_scale"].as<double>() : 1.0;
+      const double cartScale =
+        node["cartesian_velocity_scaling"]
+          ? node["cartesian_velocity_scaling"].as<double>()
+          : velocityScaling_.value_or(1.0);
+      velocityScaling_ = std::clamp(cartScale * globalScale, 0.05, 1.0);
+    }
+    catch (const YAML::Exception & ex)
+    {
+      RCLCPP_WARN_STREAM(
+        getLogger(),
+        "[CbMoveEndEffectorLinearSeeded] YAML error loading " << fullpath << ": " << ex.what());
+    }
+  }
+
 protected:
+  void applyCartesianVelocityScaling(moveit_msgs::msg::RobotTrajectory & trajectory) const
+  {
+    // Strip TOTG corner accelerations so JTC uses smooth cubic Hermite splines
+    // instead of quintic splines that ring between discontinuous +/-a_max corners.
+    for (auto & pt : trajectory.joint_trajectory.points)
+    {
+      pt.accelerations.clear();
+    }
+
+    const double scale = velocityScaling_.value_or(1.0);
+    if (scale >= 0.9999 || scale <= 0.0)
+    {
+      return;
+    }
+
+    // MoveIt2 Humble GetCartesianPath has no velocity_scaling field; rescale
+    // time_from_start and velocities directly (q'(t') = q(s*t')).
+    const double invScale = 1.0 / scale;
+    for (auto & pt : trajectory.joint_trajectory.points)
+    {
+      const double tSec =
+        static_cast<double>(pt.time_from_start.sec) +
+        static_cast<double>(pt.time_from_start.nanosec) * 1e-9;
+      const double scaledSec = tSec * invScale;
+      const auto totalNs = static_cast<int64_t>(std::llround(scaledSec * 1e9));
+      pt.time_from_start.sec = static_cast<int32_t>(totalNs / 1000000000LL);
+      pt.time_from_start.nanosec = static_cast<uint32_t>(totalNs % 1000000000LL);
+      for (double & v : pt.velocities)
+      {
+        v *= scale;
+      }
+    }
+  }
+
+  bool validateTrajectoryJointExcursion(
+    const moveit_msgs::msg::RobotTrajectory & trajectory)
+  {
+    const auto & points = trajectory.joint_trajectory.points;
+    if (points.size() < 2)
+    {
+      return true;
+    }
+
+    const size_t nJoints = points.front().positions.size();
+    std::vector<double> cumulativeDelta(nJoints, 0.0);
+
+    for (size_t i = 1; i < points.size(); ++i)
+    {
+      const auto & prev = points[i - 1].positions;
+      const auto & curr = points[i].positions;
+      if (prev.size() != nJoints || curr.size() != nJoints)
+      {
+        continue;
+      }
+
+      for (size_t j = 0; j < nJoints; ++j)
+      {
+        const double stepDelta = std::abs(curr[j] - prev[j]);
+        cumulativeDelta[j] += stepDelta;
+
+        const std::string jointName =
+          (j < trajectory.joint_trajectory.joint_names.size())
+            ? trajectory.joint_trajectory.joint_names[j]
+            : ("joint_" + std::to_string(j));
+
+        if (maxJointStepRad_ > 0.0 && stepDelta > maxJointStepRad_)
+        {
+          RCLCPP_ERROR(
+            getLogger(),
+            "[CbMoveEndEffectorLinearSeeded] REJECTED trajectory: %s jumped %.3f rad between waypoint %zu and %zu (limit=%.3f rad)",
+            jointName.c_str(), stepDelta, i - 1, i, maxJointStepRad_);
+          return false;
+        }
+
+        if (maxJointTotalDeltaRad_ > 0.0 && cumulativeDelta[j] > maxJointTotalDeltaRad_)
+        {
+          RCLCPP_ERROR(
+            getLogger(),
+            "[CbMoveEndEffectorLinearSeeded] REJECTED trajectory: %s cumulative travel %.3f rad exceeded limit %.3f rad at waypoint %zu",
+            jointName.c_str(), cumulativeDelta[j], maxJointTotalDeltaRad_, i);
+          return false;
+        }
+      }
+    }
+
+    return true;
+  }
+
   bool executeTrajectoryInterruptible(
     moveit::planning_interface::MoveGroupInterface & mgi,
     const moveit_msgs::msg::RobotTrajectory & trajectory)
